@@ -12,6 +12,7 @@ import { PXE_SEQUENCE, pxeMessage } from "@/lib/types";
 import type {
   ActivityEvent,
   Alert,
+  CanaryDeploy,
   CanaryState,
   Cluster,
   ClusterMetering,
@@ -668,12 +669,12 @@ export function advance(prev: SimState, rng: Rng): SimState {
   });
 
   // --- Canary deploys ----------------------------------------------------
-  const canaries = prev.canaries.map((c) => {
+  const canaries: CanaryDeploy[] = prev.canaries.map((c): CanaryDeploy => {
     const cluster = clusterById.get(c.clusterId);
     if (!cluster) return c;
     if (c.state === "promoted" || c.state === "aborted" || c.state === "failed") return c;
     if (c.state === "paused") {
-      if (rng.next() < 0.05) return { ...c, state: "rolling", updatedAt: now };
+      if (rng.next() < 0.05) return { ...c, state: "rolling" as CanaryState, updatedAt: now };
       return c;
     }
     // rolling
