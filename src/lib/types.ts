@@ -321,6 +321,145 @@ export interface MetricSample {
   storageGbps: number;
 }
 
+// --- PXE / bare-metal provisioning state machine -------------------------
+
+export type PxeStage =
+  | "queued"
+  | "dhcp"
+  | "tftp"
+  | "bios-fw"
+  | "image"
+  | "drivers"
+  | "dcgm"
+  | "nvsm"
+  | "fabric-join"
+  | "scheduler"
+  | "healthy"
+  | "failed";
+
+export interface PxeState {
+  nodeId: string;
+  clusterId: string;
+  stage: PxeStage;
+  progress: number;
+  startedAt: number;
+  updatedAt: number;
+  attempts: number;
+  lastError?: string;
+  logs: { t: number; stage: PxeStage; message: string }[];
+}
+
+export const PXE_SEQUENCE: PxeStage[] = [
+  "queued",
+  "dhcp",
+  "tftp",
+  "bios-fw",
+  "image",
+  "drivers",
+  "dcgm",
+  "nvsm",
+  "fabric-join",
+  "scheduler",
+  "healthy",
+];
+
+export function pxeMessage(stage: PxeStage): string {
+  switch (stage) {
+    case "queued":
+      return "Node queued for provisioning";
+    case "dhcp":
+      return "DHCP lease acquired from provisioning VLAN";
+    case "tftp":
+      return "bootx64.efi fetched via TFTP";
+    case "bios-fw":
+      return "BIOS/firmware baseline applied";
+    case "image":
+      return "Base OS image streamed and written";
+    case "drivers":
+      return "NVIDIA driver + CUDA stack installed";
+    case "dcgm":
+      return "DCGM agent enrolled and hostengine started";
+    case "nvsm":
+      return "NVSM health monitor configured";
+    case "fabric-join":
+      return "Joined InfiniBand fabric; OFED up";
+    case "scheduler":
+      return "Registered as schedulable node";
+    case "healthy":
+      return "Node healthy and in service";
+    case "failed":
+      return "Provisioning failed";
+    default:
+      return stage;
+  }
+}
+
+// --- InfiniBand fabric topology (switch / rail / plane level) -------------
+
+export type SwitchTier = "leaf" | "spine" | "super-spine";
+
+export interface FabricSwitch {
+  id: string;
+  clusterId: string;
+  tier: SwitchTier;
+  plane: number;
+  rail?: number;
+  name: string;
+  portsTotal: number;
+  portsUp: number;
+  downlinks: number;
+  uplinks: number;
+  utilPct: number;
+  errors: number;
+  status: HealthStatus;
+}
+
+// --- Spot / preempt pools -------------------------------------------------
+
+export type PoolKind = "spot" | "preempt" | "reserved";
+export type PoolState = "active" | "draining" | "paused";
+
+export interface NodePool {
+  id: string;
+  clusterId: string;
+  name: string;
+  kind: PoolKind;
+  state: PoolState;
+  nodeCount: number;
+  gpuCount: number;
+  baselineDiscount: number;
+  currentDiscount: number;
+  utilization: number;
+  evictionRate: number;
+  teams: string[];
+}
+
+// --- Canary deploys -------------------------------------------------------
+
+export type CanaryState =
+  | "pending"
+  | "rolling"
+  | "paused"
+  | "promoted"
+  | "aborted"
+  | "failed";
+
+export interface CanaryDeploy {
+  id: string;
+  clusterId: string;
+  configId: string;
+  name: string;
+  version: string;
+  state: CanaryState;
+  batches: { name: string; nodeCount: number; pct: number; state: "waiting" | "rolling" | "done" | "failed" }[];
+  currentBatch: number;
+  canaryPct: number;
+  errorBudgetPct: number;
+  startedAt: number;
+  updatedAt: number;
+  rolloutGates: { name: string; passed: boolean }[];
+}
+
 export interface Rack {
   id: string;
   clusterId: string;
@@ -416,6 +555,27 @@ export interface Notification {
   read: boolean;
 }
 
+// --- Virtualized fleet index (large-scale node table) ---------------------
+
+export interface FleetIndexRow {
+  id: string;
+  clusterId: string;
+  clusterName: string;
+  hostname: string;
+  regionId: string;
+  rack: string;
+  slot: number;
+  gpuModelId: string;
+  gpuCount: number;
+  utilization: number;
+  tempC: number;
+  powerW: number;
+  status: HealthStatus;
+  pxeStage: PxeStage | "n/a";
+  poolKind: PoolKind;
+  materialized: boolean;
+}
+
 export interface SimState {
   tick: number;
   running: boolean;
@@ -440,6 +600,11 @@ export interface SimState {
   metering: Record<string, ClusterMetering>;
   configs: ClusterConfig[];
   notifications: Notification[];
+  pxe: Record<string, PxeState>;
+  switches: Record<string, FabricSwitch[]>;
+  pools: NodePool[];
+  canaries: CanaryDeploy[];
+  fleetIndex: Record<string, FleetIndexRow[]>;
   history: Record<string, MetricSample[]>;
   globalHistory: MetricSample[];
   activity: ActivityEvent[];

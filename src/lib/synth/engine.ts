@@ -8,17 +8,21 @@ import {
 import { clamp } from "@/lib/format";
 import { Rng, hashString } from "@/lib/rng";
 import { stepsFor } from "@/lib/runbooks";
+import { PXE_SEQUENCE, pxeMessage } from "@/lib/types";
 import type {
   ActivityEvent,
   Alert,
+  CanaryState,
   Cluster,
   ClusterMetering,
   ClusterNode,
   ClusterSettings,
+  FabricSwitch,
   GpuDevice,
   Job,
   MetricSample,
   Notification,
+  PxeState,
   Rack,
   SimState,
 } from "@/lib/types";
@@ -560,6 +564,143 @@ export function advance(prev: SimState, rng: Rng): SimState {
     ? [...newNotifications, ...prev.notifications].slice(0, 40)
     : prev.notifications;
 
+  // --- PXE provisioning state machine ------------------------------------
+  const pxe: Record<string, PxeState> = { ...prev.pxe };
+  const nodesById = new Map(nodes.map((n) => [n.id, n]));
+  for (const id of Object.keys(pxe)) {
+    const state = pxe[id];
+    const node = nodesById.get(id);
+    if (!node) continue;
+
+    if (state.stage === "healthy") {
+      // Occasionally a node re-provisions (maintenance / firmware).
+      if (rng.next() < 0.0008) {
+        pxe[id] = {
+          ...state,
+          stage: "queued",
+          progress: 0,
+          startedAt: now,
+          updatedAt: now,
+          attempts: state.attempts + 1,
+          logs: [{ t: now, stage: "queued", message: pxeMessage("queued") }],
+        };
+      }
+      continue;
+    }
+
+    if (state.stage === "failed") {
+      if (rng.next() < 0.08) {
+        pxe[id] = { ...state, stage: "queued", progress: 0, updatedAt: now, lastError: undefined };
+      }
+      continue;
+    }
+
+    // Advance the stage progressively.
+    const step = rng.range(6, 22);
+    let progress = state.progress + step;
+    let stage: PxeState["stage"] = state.stage;
+    let lastError: string | undefined = state.lastError;
+    const logs = [...state.logs];
+    if (progress >= 100) {
+      const idx = PXE_SEQUENCE.indexOf(stage);
+      const nextStage = PXE_SEQUENCE[Math.min(idx + 1, PXE_SEQUENCE.length - 1)];
+      stage = nextStage;
+      progress = nextStage === "healthy" ? 100 : 0;
+      logs.push({ t: now, stage: nextStage, message: pxeMessage(nextStage) });
+      // small failure chance during imaging/drivers
+      if ((nextStage === "image" || nextStage === "drivers") && rng.next() < 0.03) {
+        stage = "failed";
+        progress = 100;
+        lastError = rng.pick(["netboot timeout", "image checksum mismatch", "driver DKMS build failed"]);
+        logs.push({ t: now, stage: "failed", message: `Provisioning failed: ${lastError}` });
+      }
+    }
+    pxe[id] = {
+      ...state,
+      stage,
+      progress: +clamp(progress, 0, 100).toFixed(0),
+      updatedAt: now,
+      lastError,
+      logs: logs.slice(-20),
+    };
+  }
+
+  // --- InfiniBand / fabric switch telemetry ------------------------------
+  const switches: Record<string, FabricSwitch[]> = { ...prev.switches };
+  for (const cluster of clusters) {
+    const list = switches[cluster.id];
+    if (!list) continue;
+    switches[cluster.id] = list.map((sw) => {
+      const util = clamp(sw.utilPct + (cluster.utilization * 100 - sw.utilPct) * 0.08 + rng.gaussian(0, 2), 5, 99);
+      const portsUp = Math.round(
+        clamp(sw.portsUp + (rng.next() < 0.02 ? (rng.bool() ? 1 : -1) : 0), sw.portsTotal * 0.85, sw.portsTotal)
+      );
+      const errors = sw.errors + (rng.next() < 0.005 ? 1 : 0);
+      return {
+        ...sw,
+        utilPct: +util.toFixed(0),
+        portsUp,
+        errors,
+        status: portsUp < sw.portsTotal * 0.9 || errors > 20 ? "warning" : "healthy",
+      };
+    });
+  }
+
+  // --- Spot / preempt pools ---------------------------------------------
+  const pools = prev.pools.map((pool) => {
+    const cluster = clusterById.get(pool.clusterId);
+    if (!cluster) return pool;
+    const util = clamp(pool.utilization + (cluster.utilization - pool.utilization) * 0.1 + rng.gaussian(0, 0.03), 0.1, 0.99);
+    const evictions = pool.kind === "spot" || pool.kind === "preempt"
+      ? rng.next() < 0.12
+        ? +rng.range(0.5, 6).toFixed(2)
+        : clamp(pool.evictionRate + rng.gaussian(0, 0.15), 0, 12)
+      : 0;
+    const currentDiscount = +clamp(
+      pool.baselineDiscount + (util - 0.7) * 0.1 * (pool.kind === "reserved" ? 0.2 : 1) + (evictions / 100),
+      pool.baselineDiscount * 0.8,
+      pool.kind === "reserved" ? 0.35 : 0.9
+    ).toFixed(2);
+    let state = pool.state;
+    if (state === "active" && cluster.status === "degraded" && rng.next() < 0.03) state = "draining";
+    else if (state === "draining" && rng.next() < 0.05) state = "active";
+    return { ...pool, utilization: +util.toFixed(2), evictionRate: evictions, currentDiscount, state };
+  });
+
+  // --- Canary deploys ----------------------------------------------------
+  const canaries = prev.canaries.map((c) => {
+    const cluster = clusterById.get(c.clusterId);
+    if (!cluster) return c;
+    if (c.state === "promoted" || c.state === "aborted" || c.state === "failed") return c;
+    if (c.state === "paused") {
+      if (rng.next() < 0.05) return { ...c, state: "rolling", updatedAt: now };
+      return c;
+    }
+    // rolling
+    const batches = c.batches.map((b) => ({ ...b }));
+    const cur = batches[c.currentBatch];
+    let state: CanaryState = c.state;
+    let currentBatch = c.currentBatch;
+    let updatedAt = now;
+    if (cur) {
+      cur.state = "rolling";
+      if (rng.next() < 0.25) {
+        cur.state = "done";
+        const gatesOk = c.rolloutGates.every((g) => g.passed) && rng.next() < 0.96;
+        if (!gatesOk) {
+          state = "failed";
+          cur.state = "failed";
+        } else if (currentBatch + 1 >= batches.length) {
+          state = "promoted";
+          currentBatch = batches.length;
+        } else {
+          currentBatch += 1;
+        }
+      }
+    }
+    return { ...c, batches, state, currentBatch, updatedAt };
+  });
+
   return {
     ...prev,
     tick,
@@ -572,6 +713,10 @@ export function advance(prev: SimState, rng: Rng): SimState {
     racks,
     metering,
     notifications,
+    pxe,
+    switches,
+    pools,
+    canaries,
     history,
     globalHistory,
     activity,

@@ -21,8 +21,17 @@ import type {
   Alert,
   Cluster,
   ClusterKind,
+  CanaryDeploy,
+  CanaryState,
   ClusterConfig,
   ClusterMetering,
+  FabricSwitch,
+  FleetIndexRow,
+  NodePool,
+  PoolKind,
+  PoolState,
+  PxeStage,
+  PxeState,
   ClusterNode,
   ClusterSettings,
   Connectivity,
@@ -43,6 +52,7 @@ import type {
   User,
   UserRole,
 } from "@/lib/types";
+import { PXE_SEQUENCE, pxeMessage } from "@/lib/types";
 import { clamp } from "@/lib/format";
 
 const CLUSTER_NAMES = [
@@ -715,6 +725,217 @@ function makeMetering(rng: Rng, cluster: Cluster, filesystems: Filesystem[]): Cl
   };
 }
 
+function makePxe(rng: Rng, node: ClusterNode, now: number): PxeState {
+  const clusterProvisioning = false;
+  const stage: PxeStage = node.status === "provisioning" ? rng.pick(["dhcp", "tftp", "image", "drivers"]) : "healthy";
+  const idx = PXE_SEQUENCE.indexOf(stage);
+  const progress = clusterProvisioning ? rng.range(10, 90) : stage === "healthy" ? 100 : rng.range(10, 90);
+  const logs = PXE_SEQUENCE.slice(0, Math.max(1, idx + 1)).map((s, i) => ({
+    t: now - (idx - i) * 4000,
+    stage: s,
+    message: pxeMessage(s),
+  }));
+  return {
+    nodeId: node.id,
+    clusterId: node.clusterId,
+    stage,
+    progress: +progress.toFixed(0),
+    startedAt: now - rng.int(60, 86400),
+    updatedAt: now,
+    attempts: rng.next() < 0.1 ? rng.int(2, 3) : 1,
+    lastError: node.status === "critical" ? "netboot timeout" : undefined,
+    logs,
+  };
+}
+
+function makeSwitches(rng: Rng, cluster: Cluster): FabricSwitch[] {
+  const switches: FabricSwitch[] = [];
+  const planes = cluster.gpuCount >= 1024 ? 4 : cluster.gpuCount >= 256 ? 2 : 1;
+  const leaves = Math.max(2, Math.ceil(cluster.nodeCount / 16));
+  const spines = Math.max(2, Math.ceil(leaves / 4));
+  const isIB = cluster.fabric.includes("InfiniBand");
+  const kindTier = isIB ? "InfiniBand" : "Ethernet";
+  void kindTier;
+
+  for (let p = 0; p < planes; p++) {
+    for (let r = 0; r < (isIB ? 2 : 1); r++) {
+      for (let i = 0; i < leaves; i++) {
+        const portsTotal = 64;
+        const portsUp = Math.round(portsTotal * rng.range(0.9, 1));
+        switches.push({
+          id: `${cluster.id}-leaf-p${p}-r${r}-${i}`,
+          clusterId: cluster.id,
+          tier: "leaf",
+          plane: p,
+          rail: isIB ? r : undefined,
+          name: `leaf-${String.fromCharCode(65 + p)}${r}${String(i + 1).padStart(2, "0")}`,
+          portsTotal,
+          portsUp,
+          downlinks: Math.round(portsUp * 0.75),
+          uplinks: Math.round(portsUp * 0.25),
+          utilPct: +rng.range(35, 92).toFixed(0),
+          errors: rng.next() < 0.15 ? rng.int(1, 20) : 0,
+          status: rng.next() < 0.06 ? "warning" : "healthy",
+        });
+      }
+    }
+    for (let i = 0; i < spines; i++) {
+      const portsTotal = 128;
+      const portsUp = Math.round(portsTotal * rng.range(0.92, 1));
+      switches.push({
+        id: `${cluster.id}-spine-p${p}-${i}`,
+        clusterId: cluster.id,
+        tier: "spine",
+        plane: p,
+        name: `spine-${String.fromCharCode(65 + p)}${String(i + 1).padStart(2, "0")}`,
+        portsTotal,
+        portsUp,
+        downlinks: Math.round(portsUp * 0.85),
+        uplinks: Math.round(portsUp * 0.15),
+        utilPct: +rng.range(30, 80).toFixed(0),
+        errors: rng.next() < 0.1 ? rng.int(1, 12) : 0,
+        status: "healthy",
+      });
+    }
+  }
+  if (cluster.gpuCount >= 2048) {
+    for (let i = 0; i < 2; i++) {
+      switches.push({
+        id: `${cluster.id}-super-${i}`,
+        clusterId: cluster.id,
+        tier: "super-spine",
+        plane: 0,
+        name: `super-spine-${String(i + 1).padStart(2, "0")}`,
+        portsTotal: 256,
+        portsUp: 256,
+        downlinks: 200,
+        uplinks: 56,
+        utilPct: +rng.range(25, 70).toFixed(0),
+        errors: 0,
+        status: "healthy",
+      });
+    }
+  }
+  return switches;
+}
+
+function makePools(rng: Rng, cluster: Cluster, teams: Team[]): NodePool[] {
+  const defs: { kind: PoolKind; name: string }[] = [
+    { kind: "reserved", name: "reserved-base" },
+    { kind: "spot", name: "spot-opportunistic" },
+    { kind: "preempt", name: "preempt-burst" },
+  ];
+  return defs.map((d, i) => {
+    const share = d.kind === "reserved" ? rng.range(0.5, 0.7) : d.kind === "spot" ? rng.range(0.15, 0.3) : rng.range(0.1, 0.2);
+    const gpuCount = Math.max(8, Math.round(cluster.gpuCount * share));
+    return {
+      id: `${cluster.id}-pool-${i}`,
+      clusterId: cluster.id,
+      name: `${cluster.name.toLowerCase()}-${d.name}`,
+      kind: d.kind,
+      state: "active" as PoolState,
+      nodeCount: Math.max(1, Math.round(cluster.nodeCount * share)),
+      gpuCount,
+      baselineDiscount: d.kind === "reserved" ? 0.35 : d.kind === "spot" ? 0.62 : 0.55,
+      currentDiscount: +(d.kind === "reserved" ? 0.35 : rng.range(0.4, 0.75)).toFixed(2),
+      utilization: +rng.range(0.3, 0.98).toFixed(2),
+      evictionRate: +(d.kind === "spot" ? rng.range(0.5, 4) : d.kind === "preempt" ? rng.range(1, 6) : 0).toFixed(2),
+      teams: rng.pickMany(teams.map((t) => t.id), rng.int(1, Math.min(4, teams.length))),
+    };
+  });
+}
+
+function makeCanary(rng: Rng, cluster: Cluster, config: ClusterConfig, now: number): CanaryDeploy {
+  const batchCount = 4;
+  const canaryPct = 0.1;
+  const currentBatch = rng.int(0, batchCount - 1);
+  const stateRoll = rng.next();
+  const state: CanaryState = stateRoll < 0.45 ? "rolling" : stateRoll < 0.65 ? "pending" : stateRoll < 0.85 ? "promoted" : "aborted";
+  const batches = Array.from({ length: batchCount }, (_, i) => {
+    const pct = i === 0 ? 0.1 : i === 1 ? 0.25 : i === 2 ? 0.5 : 0.15;
+    const batchState: "waiting" | "rolling" | "done" | "failed" =
+      state === "promoted" ? "done" : i < currentBatch ? "done" : i === currentBatch && state === "rolling" ? "rolling" : "waiting";
+    return { name: `batch-${i + 1}`, nodeCount: Math.max(1, Math.round(cluster.nodeCount * pct)), pct, state: batchState };
+  });
+  return {
+    id: `${cluster.id}-canary-${config.id.slice(-4)}`,
+    clusterId: cluster.id,
+    configId: config.id,
+    name: `${config.name}-rollout`,
+    version: `v${rng.int(1, 5)}.${rng.int(0, 9)}.${rng.int(0, 9)}`,
+    state,
+    batches,
+    currentBatch: state === "promoted" ? batchCount : currentBatch,
+    canaryPct,
+    errorBudgetPct: +rng.range(0.05, 0.5).toFixed(2),
+    startedAt: now - rng.int(600, 86400),
+    updatedAt: now - rng.int(0, 600),
+    rolloutGates: [
+      { name: "DCGM health", passed: rng.next() < 0.9 },
+      { name: "ECC clean", passed: rng.next() < 0.95 },
+      { name: "Fabric up", passed: rng.next() < 0.92 },
+      { name: "Job success rate", passed: rng.next() < 0.85 },
+    ],
+  };
+}
+
+function makeFleetIndex(rng: Rng, clusters: Cluster[], nodes: ClusterNode[]): Record<string, FleetIndexRow[]> {
+  const index: Record<string, FleetIndexRow[]> = {};
+  const HARD_CAP = 1200; // per-materialised-cluster synthetic rows (keeps total bounded)
+  for (const cluster of clusters) {
+    const rows: FleetIndexRow[] = [];
+    const clusterNodes = nodes.filter((n) => n.clusterId === cluster.id && n.role === "gpu-worker");
+    // materialized rows from real nodes
+    for (const n of clusterNodes) {
+      const avgUtil = n.gpus.length ? n.gpus.reduce((s, g) => s + g.utilPct, 0) / n.gpus.length / 100 : 0;
+      const maxTemp = n.gpus.length ? Math.max(...n.gpus.map((g) => g.tempC)) : 0;
+      rows.push({
+        id: n.id,
+        clusterId: cluster.id,
+        clusterName: cluster.name,
+        hostname: n.hostname,
+        regionId: cluster.regionId,
+        rack: n.rack,
+        slot: n.slot,
+        gpuModelId: cluster.gpuModelId,
+        gpuCount: n.gpus.length,
+        utilization: +avgUtil.toFixed(3),
+        tempC: +maxTemp.toFixed(0),
+        powerW: n.powerW,
+        status: n.status,
+        pxeStage: n.status === "provisioning" ? "image" : "healthy",
+        poolKind: rng.pick(["reserved", "spot", "preempt"] as PoolKind[]),
+        materialized: true,
+      });
+    }
+    // synthetic tail rows represent the rest of the fleet for the virtual table
+    const target = Math.min(cluster.nodeCount, HARD_CAP);
+    for (let i = rows.length; i < target; i++) {
+      const rack = Math.floor(i / 8) + 1;
+      rows.push({
+        id: `${cluster.id}-virt-${i}`,
+        clusterId: cluster.id,
+        clusterName: cluster.name,
+        hostname: `${cluster.name.slice(0, 3).toLowerCase()}-gpu-${String(rack).padStart(2, "0")}${String((i % 8) + 1).padStart(2, "0")}`,
+        regionId: cluster.regionId,
+        rack: `R${String(rack).padStart(2, "0")}`,
+        slot: (i % 8) + 1,
+        gpuModelId: cluster.gpuModelId,
+        gpuCount: cluster.gpusPerNode,
+        utilization: +rng.range(0, 1).toFixed(3),
+        tempC: +rng.range(38, 88).toFixed(0),
+        powerW: Math.round(GPU_BY_ID[cluster.gpuModelId].typicalPowerW * cluster.gpusPerNode * rng.range(0.4, 1)),
+        status: rng.next() < 0.02 ? "warning" : rng.next() < 0.005 ? "critical" : "healthy",
+        pxeStage: rng.next() < 0.01 ? rng.pick(["dhcp", "tftp", "image", "drivers", "dcgm"]) : "healthy",
+        poolKind: rng.pick(["reserved", "spot", "preempt"] as PoolKind[]),
+        materialized: false,
+      });
+    }
+    index[cluster.id] = rows;
+  }
+  return index;
+}
+
 export function generateState(seed: number): SimState {
   const rng = new Rng(seed);
   const now = Date.now();
@@ -801,6 +1022,23 @@ export function generateState(seed: number): SimState {
       configs.push(makeConfig(rng, cluster, cfgCounter++, now));
     }
   }
+
+  // New: PXE state, fabric switches, pools, canaries, virtual fleet index.
+  const pxe: Record<string, PxeState> = {};
+  for (const node of nodes) {
+    pxe[node.id] = makePxe(rng, node, now);
+  }
+  const switches: Record<string, FabricSwitch[]> = {};
+  const pools: NodePool[] = [];
+  const canaries: CanaryDeploy[] = [];
+  for (const cluster of clusters) {
+    switches[cluster.id] = makeSwitches(rng, cluster);
+    pools.push(...makePools(rng, cluster, teams));
+    for (const config of configs.filter((c) => c.clusterId === cluster.id)) {
+      if (rng.next() < 0.6) canaries.push(makeCanary(rng, cluster, config, now));
+    }
+  }
+  const fleetIndex = makeFleetIndex(rng, clusters, nodes);
   const priceBook: PriceBook = {
     computePerGpuHour: 3.4,
     storagePerTbMonth: 42,
@@ -845,6 +1083,11 @@ export function generateState(seed: number): SimState {
     metering,
     configs,
     notifications: [],
+    pxe,
+    switches,
+    pools,
+    canaries,
+    fleetIndex,
     history,
     globalHistory,
     activity,
